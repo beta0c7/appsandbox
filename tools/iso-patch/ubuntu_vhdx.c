@@ -1195,7 +1195,10 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "fi\n"
         "if ! id \"$ASB_USER\" >/dev/null 2>&1; then\n"
         "    if command -v useradd >/dev/null 2>&1; then\n"
-        "        useradd -m -s /bin/bash -c 'AppSandbox User' -G sudo,plugdev,lpadmin \"$ASB_USER\" \\\n"
+        "        ADMIN_GRPS=\"\"\n"
+        "        for g in wheel sudo; do if getent group \"$g\" >/dev/null 2>&1; then ADMIN_GRPS=\"$ADMIN_GRPS,$g\"; fi; done\n"
+        "        ADMIN_GRPS=${ADMIN_GRPS#,}\n"
+        "        useradd -m -s /bin/bash -c 'AppSandbox User' ${ADMIN_GRPS:+-G \"$ADMIN_GRPS\"} \"$ASB_USER\" \\\n"
         "          && echo \"OK: useradd $ASB_USER\" || echo \"FAIL: useradd rc=$?\"\n"
         "        if [ -n \"$ASB_HASH\" ]; then\n"
         "            usermod -p \"$ASB_HASH\" \"$ASB_USER\" \\\n"
@@ -1767,6 +1770,110 @@ static int stage_manifest_into_rootfs(const wchar_t *manifest_path,
     return count;
 }
 
+static int install_arch_bootloader(wchar_t iso_letter, const wchar_t *esp_dir, const char *root_uuid)
+{
+    /* esp_dir has trailing backslash. */
+    wchar_t boot_dir[MAX_PATH], entry_dir[MAX_PATH], loader_dir[MAX_PATH];
+    swprintf_s(boot_dir, MAX_PATH, L"%sEFI", esp_dir);
+    CreateDirectoryW(boot_dir, NULL);
+    swprintf_s(boot_dir, MAX_PATH, L"%sEFI\\BOOT", esp_dir);
+    CreateDirectoryW(boot_dir, NULL);
+    swprintf_s(boot_dir, MAX_PATH, L"%sboot", esp_dir);
+    CreateDirectoryW(boot_dir, NULL);
+    swprintf_s(loader_dir, MAX_PATH, L"%sloader", esp_dir);
+    CreateDirectoryW(loader_dir, NULL);
+    swprintf_s(entry_dir, MAX_PATH, L"%sloader\\entries", esp_dir);
+    CreateDirectoryW(entry_dir, NULL);
+
+    /* 1. Copy BOOTx64.EFI from ISO */
+    wchar_t src_boot[MAX_PATH], dst_boot[MAX_PATH];
+    swprintf_s(src_boot, MAX_PATH, L"%c:\\EFI\\BOOT\\BOOTx64.EFI", iso_letter);
+    swprintf_s(dst_boot, MAX_PATH, L"%sEFI\\BOOT\\BOOTx64.EFI", esp_dir);
+    if (!CopyFileW(src_boot, dst_boot, FALSE)) {
+        log_err(L"Failed to copy BOOTx64.EFI from ISO: %lu", GetLastError());
+        return -1;
+    }
+
+    /* 2. Locate kernel and initramfs on ISO */
+    wchar_t iso_boot_dir[MAX_PATH];
+    swprintf_s(iso_boot_dir, MAX_PATH, L"%c:\\arch\\boot\\x86_64", iso_letter);
+    
+    wchar_t src_k[MAX_PATH], src_i[MAX_PATH];
+    if (u_find_first(iso_boot_dir, L"vmlinuz-*", src_k, MAX_PATH) != 0) {
+        log_err(L"Failed to find vmlinuz inside E:\\arch\\boot\\x86_64");
+        return -1;
+    }
+    if (u_find_first(iso_boot_dir, L"initramfs-*", src_i, MAX_PATH) != 0) {
+        log_err(L"Failed to find initramfs inside E:\\arch\\boot\\x86_64");
+        return -1;
+    }
+
+    /* Extract just the file names */
+    wchar_t *k_name = wcsrchr(src_k, L'\\');
+    if (k_name) k_name++; else k_name = src_k;
+    
+    wchar_t *i_name = wcsrchr(src_i, L'\\');
+    if (i_name) i_name++; else i_name = src_i;
+
+    /* Destination paths */
+    wchar_t dst_k[MAX_PATH], dst_i[MAX_PATH];
+    swprintf_s(dst_k, MAX_PATH, L"%sboot\\%s", esp_dir, k_name);
+    swprintf_s(dst_i, MAX_PATH, L"%sboot\\%s", esp_dir, i_name);
+
+    log_msg(L"Arch Boot: copying kernel %s...", k_name);
+    if (!CopyFileW(src_k, dst_k, FALSE)) {
+        log_err(L"Failed to copy kernel: %lu", GetLastError());
+        return -1;
+    }
+    log_msg(L"Arch Boot: copying initramfs %s...", i_name);
+    if (!CopyFileW(src_i, dst_i, FALSE)) {
+        log_err(L"Failed to copy initramfs: %lu", GetLastError());
+        return -1;
+    }
+
+    /* 3. Write loader.conf */
+    wchar_t loader_conf_path[MAX_PATH];
+    swprintf_s(loader_conf_path, MAX_PATH, L"%sloader\\loader.conf", esp_dir);
+    HANDLE h_loader = CreateFileW(loader_conf_path, GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h_loader == INVALID_HANDLE_VALUE) {
+        log_err(L"CreateFileW loader.conf failed: %lu", GetLastError());
+        return -1;
+    }
+    char l_cfg[] = "default arch.conf\ntimeout 0\n";
+    DWORD wr = 0;
+    WriteFile(h_loader, l_cfg, (DWORD)strlen(l_cfg), &wr, NULL);
+    CloseHandle(h_loader);
+
+    /* 4. Write loader/entries/arch.conf */
+    wchar_t arch_conf_path[MAX_PATH];
+    swprintf_s(arch_conf_path, MAX_PATH, L"%sloader\\entries\\arch.conf", esp_dir);
+    HANDLE h_arch = CreateFileW(arch_conf_path, GENERIC_WRITE, 0, NULL,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h_arch == INVALID_HANDLE_VALUE) {
+        log_err(L"CreateFileW arch.conf failed: %lu", GetLastError());
+        return -1;
+    }
+    
+    char a_cfg[1024];
+    char k_name_a[256], i_name_a[256];
+    WideCharToMultiByte(CP_UTF8, 0, k_name, -1, k_name_a, sizeof(k_name_a), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, i_name, -1, i_name_a, sizeof(i_name_a), NULL, NULL);
+
+    snprintf(a_cfg, sizeof(a_cfg),
+        "title Omarchy OS\n"
+        "linux /boot/%s\n"
+        "initrd /boot/%s\n"
+        "options root=UUID=%s ro quiet splash xe.enable_panel_replay=0 initramfs_async=0 console=tty0 console=ttyS0,115200\n",
+        k_name_a, i_name_a, root_uuid);
+    
+    wr = 0;
+    WriteFile(h_arch, a_cfg, (DWORD)strlen(a_cfg), &wr, NULL);
+    CloseHandle(h_arch);
+
+    return 0;
+}
+
 /* ======================================================================
  *  Top-level orchestrator.
  * ====================================================================== */
@@ -1780,6 +1887,7 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     DWORD result;
     wchar_t iso_path[MAX_PATH];
     wchar_t vhdx_path[MAX_PATH];
+    BOOL is_arch = FALSE;
 
     HANDLE iso_handle = INVALID_HANDLE_VALUE;
     wchar_t iso_drive = 0;
@@ -1873,14 +1981,19 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
      * Use minimal.squashfs (the full base, ~3.4 GiB on 26.04 desktop daily) —
      * it contains /boot/vmlinuz-X.Y.Z + /boot/initrd.img-X.Y.Z. The smaller
      * minimal.standard.squashfs is an overlay only (no /boot, no kernel)
-     * and is not usable as a standalone rootfs source. */
+     * and is not usable as a standalone rootfs source. For Arch/Omarchy,
+     * use arch/x86_64/airootfs.sfs. */
     wchar_t sqfs_path[MAX_PATH];
     swprintf(sqfs_path, MAX_PATH, L"%c:\\casper\\minimal.squashfs", iso_drive);
     if (GetFileAttributesW(sqfs_path) == INVALID_FILE_ATTRIBUTES) {
-        log_err(L"casper/minimal.squashfs not found on ISO");
-        goto cleanup;
+        swprintf(sqfs_path, MAX_PATH, L"%c:\\arch\\x86_64\\airootfs.sfs", iso_drive);
+        if (GetFileAttributesW(sqfs_path) == INVALID_FILE_ATTRIBUTES) {
+            log_err(L"Neither casper/minimal.squashfs nor arch/x86_64/airootfs.sfs found on ISO");
+            goto cleanup;
+        }
+        is_arch = TRUE;
     }
-    log_msg(L"Source squashfs: %s", sqfs_path);
+    log_msg(L"Source squashfs: %s (is_arch=%d)", sqfs_path, is_arch);
 
     /* ---- Step 3: Create + attach the VHDX (fixed allocation). ---- */
     log_msg(L"Creating %d GiB VHDX...", size_gb);
@@ -2098,39 +2211,41 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
     }
 
     /* ---- Step 7: Stage grub modules + shim binaries from .debs. ---- */
-    log_msg(L"Installing grub modules + shim from ISO .debs...");
-    /* "Building" — not "Staging". This is part of the vanilla Ubuntu
-       install; the AppSandbox-extras staging phase is later (Step 10). */
-    log_progress(78, L"Installing grub modules");
-    stage_grub_modules(iso_drive, ew);
+    if (!is_arch) {
+        log_msg(L"Installing grub modules + shim from ISO .debs...");
+        /* "Building" — not "Staging". This is part of the vanilla Ubuntu
+           install; the AppSandbox-extras staging phase is later (Step 10). */
+        log_progress(78, L"Installing grub modules");
+        stage_grub_modules(iso_drive, ew);
 
-    /* ---- Step 7b: Stage the ISO's pool/main + dists/ into rootfs so
-       first-boot apt operations (dkms + build-essential +
-       linux-headers-$(uname -r)) work offline without needing internet
-       or a fresh apt update against archive.ubuntu.com. ~296 MiB. ---- */
-    log_msg(L"Staging ISO pool/main + dists/ as a local apt source...");
-    log_progress(80, L"Building local apt mirror");
-    stage_local_apt(iso_drive, ew);
+        /* ---- Step 7b: Stage the ISO's pool/main + dists/ into rootfs so
+           first-boot apt operations (dkms + build-essential +
+           linux-headers-$(uname -r)) work offline without needing internet
+           or a fresh apt update against archive.ubuntu.com. ~296 MiB. ---- */
+        log_msg(L"Staging ISO pool/main + dists/ as a local apt source...");
+        log_progress(80, L"Building local apt mirror");
+        stage_local_apt(iso_drive, ew);
 
-    /* ---- Step 8: Bootstrap /boot/grub/grub.cfg. ---- */
-    {
-        ext4_writer_add_dir(ew, "/boot/grub", 0755, 0, 0, (uint32_t)time(NULL));
-        char boot_cfg[1024];
-        snprintf(boot_cfg, sizeof(boot_cfg),
-            "set timeout=0\n"
-            "menuentry 'Ubuntu (bootstrap)' {\n"
-            "    insmod gzio\n"
-            "    insmod part_gpt\n"
-            "    insmod ext2\n"
-            "    set root='hd0,gpt2'\n"
-            "    linux  /boot/vmlinuz-%s root=UUID=%s ro"
-            " " IP_EARLYCON_A "console=tty0 console=" IP_SERIAL_A ",115200\n"
-            "    initrd /boot/initrd.img-%s\n"
-            "}\n",
-            kernel_ver, uuid_text, kernel_ver);
-        ext4_writer_add_file(ew, "/boot/grub/grub.cfg", 0644, 0, 0,
-                             (uint32_t)time(NULL),
-                             boot_cfg, strlen(boot_cfg));
+        /* ---- Step 8: Bootstrap /boot/grub/grub.cfg. ---- */
+        {
+            ext4_writer_add_dir(ew, "/boot/grub", 0755, 0, 0, (uint32_t)time(NULL));
+            char boot_cfg[1024];
+            snprintf(boot_cfg, sizeof(boot_cfg),
+                "set timeout=0\n"
+                "menuentry 'Ubuntu (bootstrap)' {\n"
+                "    insmod gzio\n"
+                "    insmod part_gpt\n"
+                "    insmod ext2\n"
+                "    set root='hd0,gpt2'\n"
+                "    linux  /boot/vmlinuz-%s root=UUID=%s ro"
+                " " IP_EARLYCON_A "console=tty0 console=" IP_SERIAL_A ",115200\n"
+                "    initrd /boot/initrd.img-%s\n"
+                "}\n",
+                kernel_ver, uuid_text, kernel_ver);
+            ext4_writer_add_file(ew, "/boot/grub/grub.cfg", 0644, 0, 0,
+                                 (uint32_t)time(NULL),
+                                 boot_cfg, strlen(boot_cfg));
+        }
     }
 
     /* ---- Step 9: First-boot service. ---- */
@@ -2190,10 +2305,16 @@ int do_ubuntu_to_vhdx(const wchar_t *iso_path_arg,
         goto cleanup;
     }
 
-    log_msg(L"Installing signed shim + grub from ISO .debs...");
-    log_progress(95, L"Installing boot loader");
-    if (install_signed_efi(iso_drive, esp_mount) != 0) goto cleanup;
-    if (write_redirect_grub_cfg(esp_mount, uuid_text) != 0) goto cleanup;
+    if (is_arch) {
+        log_msg(L"Installing systemd-boot for Arch/Omarchy...");
+        log_progress(95, L"Installing boot loader");
+        if (install_arch_bootloader(iso_drive, esp_mount, uuid_text) != 0) goto cleanup;
+    } else {
+        log_msg(L"Installing signed shim + grub from ISO .debs...");
+        log_progress(95, L"Installing boot loader");
+        if (install_signed_efi(iso_drive, esp_mount) != 0) goto cleanup;
+        if (write_redirect_grub_cfg(esp_mount, uuid_text) != 0) goto cleanup;
+    }
 
     log_progress(99, L"Done");
     log_done(vhdx_path);

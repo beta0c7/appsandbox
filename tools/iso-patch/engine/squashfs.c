@@ -7,6 +7,49 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef size_t (__cdecl *fn_ZSTD_decompress)(void* dst, size_t dstCapacity, const void* src, size_t srcSize);
+typedef unsigned int (__cdecl *fn_ZSTD_isError)(size_t code);
+typedef const char* (__cdecl *fn_ZSTD_getErrorName)(size_t code);
+
+static fn_ZSTD_decompress g_ZSTD_decompress = NULL;
+static fn_ZSTD_isError g_ZSTD_isError = NULL;
+static fn_ZSTD_getErrorName g_ZSTD_getErrorName = NULL;
+static HMODULE g_hZstd = NULL;
+static int g_zstd_load_attempted = 0;
+
+static int load_zstd_dll(void)
+{
+    if (g_zstd_load_attempted) return g_hZstd ? 0 : -1;
+    g_zstd_load_attempted = 1;
+
+    g_hZstd = LoadLibraryW(L"libzstd.dll");
+    if (!g_hZstd) {
+        wchar_t path[MAX_PATH];
+        if (GetModuleFileNameW(NULL, path, MAX_PATH)) {
+            wchar_t *slash = wcsrchr(path, L'\\');
+            if (slash) {
+                wcscpy_s(slash + 1, MAX_PATH - (slash - path + 1), L"libzstd.dll");
+                g_hZstd = LoadLibraryW(path);
+            }
+        }
+    }
+    if (!g_hZstd) {
+        LOG_E("Failed to load libzstd.dll - ZSTD SquashFS decompression requires libzstd.dll");
+        return -1;
+    }
+    g_ZSTD_decompress = (fn_ZSTD_decompress)GetProcAddress(g_hZstd, "ZSTD_decompress");
+    g_ZSTD_isError = (fn_ZSTD_isError)GetProcAddress(g_hZstd, "ZSTD_isError");
+    g_ZSTD_getErrorName = (fn_ZSTD_getErrorName)GetProcAddress(g_hZstd, "ZSTD_getErrorName");
+    if (!g_ZSTD_decompress || !g_ZSTD_isError || !g_ZSTD_getErrorName) {
+        LOG_E("Failed to find ZSTD symbols in libzstd.dll");
+        FreeLibrary(g_hZstd);
+        g_hZstd = NULL;
+        return -1;
+    }
+    LOG_I("Successfully loaded libzstd.dll for ZSTD decompression!");
+    return 0;
+}
+
 /* Forward decls (definition order is reader-friendly, not call-graph order).
  * sqfs_stream_t is defined further below alongside struct sqfs_ctx. */
 struct sqfs_stream;
@@ -140,8 +183,9 @@ sqfs_ctx_t *sqfs_open(const wchar_t *path)
     }
 
     if (ctx->sb.compression_id != SQFS_COMP_XZ &&
-        ctx->sb.compression_id != SQFS_COMP_GZIP) {
-        LOG_E("  unsupported compressor %u (%s) - only XZ and GZIP impl'd",
+        ctx->sb.compression_id != SQFS_COMP_GZIP &&
+        ctx->sb.compression_id != SQFS_COMP_ZSTD) {
+        LOG_E("  unsupported compressor %u (%s) - only XZ, GZIP and ZSTD impl'd",
               ctx->sb.compression_id, sqfs_compressor_name(ctx->sb.compression_id));
         sqfs_close(ctx);
         return NULL;
@@ -407,6 +451,18 @@ int sqfs_read_metadata_block(sqfs_ctx_t *ctx, uint64_t *off,
     }
 
     /* Compressed: dispatch on compressor. Only XZ + GZIP impl'd for now. */
+    if (ctx->sb.compression_id == SQFS_COMP_ZSTD) {
+        if (load_zstd_dll() != 0) return -1;
+        size_t d_size = g_ZSTD_decompress(out, SQFS_METADATA_SIZE, inbuf, disk_len);
+        if (g_ZSTD_isError(d_size)) {
+            LOG_E("ZSTD metadata decompress failed: %hs", g_ZSTD_getErrorName(d_size));
+            return -1;
+        }
+        *out_len = d_size;
+        *off += 2 + disk_len;
+        return 0;
+    }
+
     if (ctx->sb.compression_id == SQFS_COMP_XZ) {
         /* XZ_DYNALLOC: multi-call mode. We give all input at once + a
          * large enough output buffer, then loop until XZ_STREAM_END or
@@ -794,31 +850,47 @@ int sqfs_walk(sqfs_ctx_t *ctx, sqfs_walk_cb_t cb, void *user)
  * corrupt across concurrent decompresses). */
 static __declspec(thread) struct xz_dec *g_data_dec = NULL;
 
-static int data_decompress(const uint8_t *cbuf, size_t in_size,
+static int data_decompress(uint16_t compression_id, const uint8_t *cbuf, size_t in_size,
                            uint8_t *out, size_t out_cap, size_t *out_len)
 {
-    if (!g_data_dec) {
-        g_data_dec = xz_dec_init(XZ_DYNALLOC, 1u << 20);
-        if (!g_data_dec) { LOG_E("xz_dec_init OOM"); return -1; }
-    } else {
-        xz_dec_reset(g_data_dec);
-    }
-    struct xz_buf b = { 0 };
-    b.in = cbuf; b.in_size = in_size;
-    b.out = out; b.out_size = out_cap;
-    enum xz_ret r;
-    for (;;) {
-        size_t pi = b.in_pos, po = b.out_pos;
-        r = xz_dec_run(g_data_dec, &b);
-        if (r == XZ_STREAM_END) break;
-        if (r != XZ_OK || (b.in_pos == pi && b.out_pos == po)) {
-            LOG_E("data_decompress: rc=%d in=%zu/%zu out=%zu/%zu",
-                  (int)r, b.in_pos, b.in_size, b.out_pos, b.out_size);
+    if (compression_id == SQFS_COMP_ZSTD) {
+        if (load_zstd_dll() != 0) return -1;
+        size_t d_size = g_ZSTD_decompress(out, out_cap, cbuf, in_size);
+        if (g_ZSTD_isError(d_size)) {
+            LOG_E("ZSTD data decompress failed: %hs", g_ZSTD_getErrorName(d_size));
             return -1;
         }
+        *out_len = d_size;
+        return 0;
     }
-    *out_len = b.out_pos;
-    return 0;
+
+    if (compression_id == SQFS_COMP_XZ) {
+        if (!g_data_dec) {
+            g_data_dec = xz_dec_init(XZ_DYNALLOC, 1u << 20);
+            if (!g_data_dec) { LOG_E("xz_dec_init OOM"); return -1; }
+        } else {
+            xz_dec_reset(g_data_dec);
+        }
+        struct xz_buf b = { 0 };
+        b.in = cbuf; b.in_size = in_size;
+        b.out = out; b.out_size = out_cap;
+        enum xz_ret r;
+        for (;;) {
+            size_t pi = b.in_pos, po = b.out_pos;
+            r = xz_dec_run(g_data_dec, &b);
+            if (r == XZ_STREAM_END) break;
+            if (r != XZ_OK || (b.in_pos == pi && b.out_pos == po)) {
+                LOG_E("data_decompress: rc=%d in=%zu/%zu out=%zu/%zu",
+                      (int)r, b.in_pos, b.in_size, b.out_pos, b.out_size);
+                return -1;
+            }
+        }
+        *out_len = b.out_pos;
+        return 0;
+    }
+
+    LOG_E("Data compression format %u not implemented", compression_id);
+    return -1;
 }
 
 /* ---- File content read ----
@@ -954,7 +1026,7 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
             size_t got = 0;
             /* Output cap is the true remaining logical block length, not the
              * full block_size: the tail block has only `tail` bytes left. */
-            if (data_decompress(cbuf, on_disk, out + written, this_block_logical, &got) != 0) {
+            if (data_decompress(ctx->sb.compression_id, cbuf, on_disk, out + written, this_block_logical, &got) != 0) {
                 LOG_E("data block decompress at 0x%llx", (unsigned long long)disk);
                 free(cbuf); free(out); return -1;
             }
@@ -994,7 +1066,7 @@ int sqfs_read_file(sqfs_ctx_t *ctx, const sqfs_entry_t *entry,
             fragdec_alloc = (uint8_t *)malloc(block_size);
             if (!fragdec_alloc) { free(fragbuf); free(out); return -1; }
             size_t got = 0;
-            if (data_decompress(fragbuf, on_disk, fragdec_alloc, block_size, &got) != 0) {
+            if (data_decompress(ctx->sb.compression_id, fragbuf, on_disk, fragdec_alloc, block_size, &got) != 0) {
                 free(fragdec_alloc); free(fragbuf); free(out); return -1;
             }
             fragdec = fragdec_alloc;
